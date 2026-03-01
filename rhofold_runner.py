@@ -197,15 +197,15 @@ class RhoFoldRunner:
             plddt = output['plddt'][0, :L].cpu().numpy().astype(np.float32)
             return np.clip(plddt, 0.0, 1.0)
 
-        # Fallback: compute a proxy pLDDT from per-residue coordinate variance
-        # across atom types (lower variance → higher confidence)
+        # Fallback: compute a proxy pLDDT from per-residue coordinate deviation
+        # across atom types (lower deviation → higher confidence)
         all_atoms = output['cord_tns_pred'][0, :L, :, :]  # (L, 23, 3)
         centroid = all_atoms.mean(dim=1, keepdim=True)  # (L, 1, 3)
-        var = torch.norm(all_atoms - centroid, dim=-1).mean(dim=-1)  # (L,)
-        # Normalise to [0, 1]: low variance → high confidence
-        var_np = var.cpu().numpy().astype(np.float32)
-        max_var = var_np.max() + 1e-8
-        plddt = 1.0 - (var_np / max_var)
+        mean_dist = torch.norm(all_atoms - centroid, dim=-1).mean(dim=-1)  # (L,)
+        # Normalise to [0, 1]: low deviation → high confidence
+        dist_np = mean_dist.cpu().numpy().astype(np.float32)
+        max_dist = dist_np.max() + 1e-8
+        plddt = 1.0 - (dist_np / max_dist)
         return np.clip(plddt, 0.0, 1.0).astype(np.float32)
 
     def predict_batch(self, sequences, n_recycles=4):

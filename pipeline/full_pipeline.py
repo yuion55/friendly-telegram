@@ -26,8 +26,7 @@ _WOBBLE_PAIRS = {('G', 'U'), ('U', 'G')}
 # Known RNA structural motif patterns (sequence → typical motif type)
 _GNRA_PATTERN = {'GAAA', 'GAGA', 'GCAA', 'GUAA',
                  'GACA', 'GGAA', 'GAUA', 'GCGA',
-                 'GUGA', 'GCUA', 'GUAA', 'GGGA'}
-_KINK_TURN_CONSENSUS = "GA"  # G·A pairs at kink-turn core
+                 'GUGA', 'GCUA', 'GGGA'}
 
 
 def _sequence_to_int8(sequence):
