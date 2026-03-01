@@ -588,10 +588,11 @@ def select_by_plddt_and_diversity(candidates, plddts, n_select=5,
         for fi in force_include:
             if 0 <= fi < n and fi not in selected:
                 selected.append(fi)
+    best_idx = int(np.argmax(mean_plddts))
     if not selected:
-        selected.append(int(np.argmax(mean_plddts)))
-    elif int(np.argmax(mean_plddts)) not in selected and len(selected) < n_select:
-        selected.append(int(np.argmax(mean_plddts)))
+        selected.append(best_idx)
+    elif best_idx not in selected and len(selected) < n_select:
+        selected.append(best_idx)
 
     for _ in range(n_select - len(selected)):
         best_j, best_score = -1, -1.0
