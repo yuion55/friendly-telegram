@@ -495,19 +495,19 @@ def sample_pseudoknot_ss(bpp, min_crossing_pairs=1):
     # Phase 2: Find crossing pairs to add (forming pseudoknot)
     # A pair (k, l) crosses (i, j) iff i < k < j < l or k < i < l < j
     crossing_pairs = []
-    for prob, k, l_idx in candidates:
-        if k in used or l_idx in used:
+    for prob, k, l in candidates:
+        if k in used or l in used:
             continue
         # Check if this pair crosses at least one existing stem pair
         crosses = False
         for i, j in stem_pairs:
-            if (i < k < j < l_idx) or (k < i < l_idx < j):
+            if (i < k < j < l) or (k < i < l < j):
                 crosses = True
                 break
         if crosses:
-            crossing_pairs.append((k, l_idx))
+            crossing_pairs.append((k, l))
             used.add(k)
-            used.add(l_idx)
+            used.add(l)
             if len(crossing_pairs) >= min_crossing_pairs:
                 break
 
@@ -971,10 +971,8 @@ if __name__ == "__main__":
     if pk_ss:
         # Verify at least one crossing pair exists
         has_crossing = False
-        for a_idx in range(len(pk_ss)):
-            i_a, j_a = pk_ss[a_idx]
-            for b_idx in range(a_idx + 1, len(pk_ss)):
-                i_b, j_b = pk_ss[b_idx]
+        for a_idx, (i_a, j_a) in enumerate(pk_ss):
+            for i_b, j_b in pk_ss[a_idx + 1:]:
                 if (min(i_a, j_a) < min(i_b, j_b) < max(i_a, j_a) < max(i_b, j_b)):
                     has_crossing = True
                 if (min(i_b, j_b) < min(i_a, j_a) < max(i_b, j_b) < max(i_a, j_a)):
