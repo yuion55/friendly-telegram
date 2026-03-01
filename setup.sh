@@ -19,7 +19,7 @@ if [ "$MODE" = "download" ]; then
     pip download numba numpy pandas tqdm scikit-learn scipy ripser persim \
         huggingface_hub --dest "$WHEELS_DIR"
     pip download "rhofold @ git+https://github.com/ml4bio/RhoFold.git" \
-        --dest "$WHEELS_DIR" --no-deps 2>/dev/null || \
+        --dest "$WHEELS_DIR" --no-deps || \
         pip install --target "$WHEELS_DIR/rhofold_src" \
             "rhofold @ git+https://github.com/ml4bio/RhoFold.git" --no-deps
 
@@ -46,7 +46,10 @@ elif [ "$MODE" = "offline" ]; then
     WHEEL_SEARCH="${KAGGLE_WHEELS:-$WHEELS_DIR}"
     pip install --no-index --find-links "$WHEEL_SEARCH" \
         torch torchvision numpy numba pandas tqdm scikit-learn scipy \
-        ripser persim huggingface_hub 2>/dev/null || true
+        ripser persim huggingface_hub || {
+        echo "Warning: some packages failed to install from local wheels"
+        echo "Continuing with available packages..."
+    }
 
     # Install RhoFold from local source if available
     if [ -d "$WHEEL_SEARCH/rhofold_src" ]; then
