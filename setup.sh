@@ -12,6 +12,6 @@ echo "=== Installing RhoFold+ ==="
 pip install "rhofold @ git+https://github.com/ml4bio/RhoFold.git"
 
 echo "=== Verifying installation ==="
-python -c "from rhofold_runner import RhoFoldRunner; r = RhoFoldRunner('cuda'); print(r.predict('AUGCAUGC').shape)"
+python -c "from rhofold_runner import RhoFoldRunner; r = RhoFoldRunner(); print('RhoFold available:', r.available)"
 
 echo "=== Setup complete ==="

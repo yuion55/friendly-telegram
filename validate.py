@@ -61,7 +61,7 @@ def run_validation(split, n_targets, data_root, batch_size, n_candidates):
             continue
 
         # Batched GPU inference via RhoFold if available
-        if pipeline.rhofold.available and len(sequences) > 1:
+        if pipeline.rhofold.available:
             try:
                 batch_preds = pipeline.rhofold.predict_batch(sequences)
             except Exception:
@@ -144,12 +144,16 @@ def main():
     if args.profile and torch.cuda.is_available():
         from torch.profiler import profile, ProfilerActivity
         print("Profiling first batch...")
+        profile_n = (
+            min(args.batch_size, args.n_targets)
+            if args.n_targets else args.batch_size
+        )
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
         ) as prof:
             run_validation(
-                args.split, min(args.batch_size, args.n_targets or args.batch_size),
+                args.split, profile_n,
                 args.data_root, args.batch_size, args.n_candidates,
             )
         prof.export_chrome_trace("profiler_trace.json")

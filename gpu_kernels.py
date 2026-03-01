@@ -138,7 +138,7 @@ if _CUDA_AVAILABLE:
             tile_j[ty, tx] = coords[j * 3 + tx]
         cuda.syncthreads()
 
-        if i < n_val and j < n_val:
+        if i < n_val and j < n_val and i <= j:
             dx = tile_i[tx, 0] - tile_j[ty, 0]
             dy = tile_i[tx, 1] - tile_j[ty, 1]
             dz = tile_i[tx, 2] - tile_j[ty, 2]
