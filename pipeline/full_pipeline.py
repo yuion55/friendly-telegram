@@ -11,8 +11,32 @@ from whitebox.riemannian_backbone import (
 )
 from modules.topology_correction import TopologyCorrector
 from modules.ensemble_ranking import rank_ensemble
+from modules.pseudoknot import detect_pseudoknots
 from rhofold_runner import RhoFoldRunner
 from gpu_kernels import pairwise_tm_matrix_gpu
+
+# Optional BRiQ refinement — graceful degradation if unavailable
+try:
+    from rna_briq_refinement import BRiQRefinement
+    _BRIQ_AVAILABLE = True
+except ImportError:
+    _BRIQ_AVAILABLE = False
+
+# Optional hierarchical assembly with inter-domain contact prediction
+try:
+    from rna_hierarchical_assembly import (
+        predict_interdomain_contacts, Domain, segment_domains,
+    )
+    _HIER_ASSEMBLY_AVAILABLE = True
+except ImportError:
+    _HIER_ASSEMBLY_AVAILABLE = False
+
+# Optional ensemble diversity reranker
+try:
+    from rna_ensemble_diversity import ConsensusReranker, RNAStructure
+    _ENSEMBLE_RERANKER_AVAILABLE = True
+except ImportError:
+    _ENSEMBLE_RERANKER_AVAILABLE = False
 
 
 _NUC_MAP = {'A': 0, 'C': 1, 'G': 2, 'U': 3, 'N': 4}
@@ -676,6 +700,171 @@ def rigid_body_domain_assembly(domain_coords_list, domain_ranges, full_length,
     return coords
 
 
+def briq_refine_c3prime(coords, sequence, n_steps=150, verbose=False):
+    """Apply BRiQ knowledge-based refinement to C3'-only coordinates.
+
+    Converts (L, 3) C3' coords to the coarse (L, 3, 3) representation
+    expected by BRiQRefinement (P / C4' / N per residue), runs refinement,
+    then extracts the refined C4' trace as a C3' proxy.
+
+    Parameters
+    ----------
+    coords : np.ndarray, shape (L, 3)
+        C3' atom coordinates.
+    sequence : str
+        RNA sequence.
+    n_steps : int
+        Refinement steps for BRiQ.
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    np.ndarray, shape (L, 3)
+        Refined C3' coordinates.
+    """
+    if not _BRIQ_AVAILABLE:
+        return coords
+
+    L = len(sequence)
+    if coords.shape[0] != L:
+        return coords
+
+    try:
+        # Build coarse representation: approximate P, C4', N from C3'
+        # P is offset 1.6 Å along backbone; N is offset 4.7 Å perpendicular
+        # (empirically determined constants from typical RNA geometry)
+        c3 = coords.astype(np.float64)
+        p_coords = np.zeros_like(c3)
+        c4p_coords = c3.copy()  # C4' ≈ C3' (adjacent atoms)
+        n_coords = np.zeros_like(c3)
+
+        for i in range(L):
+            if i < L - 1:
+                fwd = c3[i + 1] - c3[i]
+                fwd_norm = np.sqrt(np.sum(fwd ** 2)) + 1e-8
+                fwd = fwd / fwd_norm
+            else:
+                fwd = np.array([1.0, 0.0, 0.0])
+
+            # P offset along backbone direction
+            p_coords[i] = c3[i] - 1.6 * fwd
+            # N offset approximately perpendicular
+            perp = np.array([-fwd[1], fwd[0], 0.0])
+            perp_norm = np.sqrt(np.sum(perp ** 2)) + 1e-8
+            if perp_norm > 1e-6:
+                perp = perp / perp_norm
+            else:
+                perp = np.array([0.0, 1.0, 0.0])
+            n_coords[i] = c3[i] + 4.7 * perp
+
+        coarse = np.stack([p_coords, c4p_coords, n_coords], axis=1)  # (L, 3, 3)
+
+        refiner = BRiQRefinement(
+            n_steps=n_steps, restraint_weight=10.0, seed=42, verbose=verbose
+        )
+        refined_coarse, info = refiner.refine(coarse, sequence)
+
+        # Extract C4' (index 1) as refined C3' proxy
+        return refined_coarse[:, 1, :].astype(np.float32)
+    except Exception:
+        return coords
+
+
+def predict_interdomain_contact_restraints(sequence, domain_ranges):
+    """Predict inter-domain contact restraints for multi-domain assembly.
+
+    Uses the hierarchical assembly module's inter-domain contact prediction
+    based on sequence composition and positional embeddings.
+
+    Parameters
+    ----------
+    sequence : str
+        Full RNA sequence.
+    domain_ranges : list of tuple
+        (start, end) for each domain.
+
+    Returns
+    -------
+    list of tuple
+        (i, j, target_dist) contact restraints, or empty list if unavailable.
+    """
+    if not _HIER_ASSEMBLY_AVAILABLE:
+        return []
+
+    try:
+        domains = []
+        for di, (start, end) in enumerate(domain_ranges):
+            dom_seq = sequence[start:end]
+            domains.append(Domain(
+                domain_id=di,
+                residue_indices=np.arange(start, end, dtype=np.int32),
+                sequence=dom_seq,
+            ))
+
+        contacts = predict_interdomain_contacts(domains, contact_threshold=0.4)
+
+        # Convert contact adjacency to pairwise restraints
+        restraints = []
+        n_domains = len(domains)
+        for di in range(n_domains):
+            for dj in range(di + 1, n_domains):
+                if contacts[di, dj] > 0:
+                    # Use median residue indices as contact anchor points
+                    i_med = int(np.median(domains[di].residue_indices))
+                    j_med = int(np.median(domains[dj].residue_indices))
+                    # Target distance: closer for adjacent domains
+                    target_d = 15.0 if abs(di - dj) == 1 else 25.0
+                    restraints.append((i_med, j_med, target_d))
+        return restraints
+    except Exception:
+        return []
+
+
+def rerank_with_consensus(candidates, sequence, n_select=5):
+    """Rerank conformer candidates using consensus contact map + lDDT proxy.
+
+    Parameters
+    ----------
+    candidates : list of np.ndarray
+        List of (L, 3) coordinate arrays.
+    sequence : str
+        RNA sequence.
+    n_select : int
+        Number of conformers to return.
+
+    Returns
+    -------
+    list of int
+        Indices of selected conformers in original list.
+    """
+    if not _ENSEMBLE_RERANKER_AVAILABLE or len(candidates) <= n_select:
+        return list(range(min(len(candidates), n_select)))
+
+    try:
+        # Track original indices through reranking
+        idx_map = {}
+        structures = []
+        for i, coords in enumerate(candidates):
+            torsions = np.zeros((coords.shape[0], 7), dtype=np.float64)
+            s = RNAStructure(
+                sequence=sequence,
+                coords=coords.astype(np.float64),
+                torsions=torsions,
+            )
+            structures.append(s)
+            idx_map[id(s)] = i
+
+        reranker = ConsensusReranker(cutoff=20.0, w_consensus=0.55, w_lddt=0.45)
+        ranked = reranker.rerank(structures, top_k=n_select, verbose=False)
+
+        # Map ranked structures back to original indices via identity
+        ranked_indices = [idx_map.get(id(rs), 0) for rs in ranked]
+        return ranked_indices[:n_select]
+    except Exception:
+        return list(range(min(len(candidates), n_select)))
+
+
 class RNA3DPipeline:
     """Full RNA 3D structure prediction pipeline with RhoFold+ GPU integration."""
 
@@ -773,6 +962,18 @@ class RNA3DPipeline:
                     pass
                 grafted_candidates.append(coords)
             candidates = grafted_candidates
+
+        # Step 2d: BRiQ knowledge-based energy refinement
+        if _BRIQ_AVAILABLE and L <= 500:
+            briq_candidates = []
+            for coords in candidates:
+                try:
+                    coords = briq_refine_c3prime(
+                        coords, sequence, n_steps=80, verbose=False)
+                except Exception:
+                    pass
+                briq_candidates.append(coords)
+            candidates = briq_candidates
 
         # Step 3: GPU ensemble scoring — proxy scores via centroid agreement
         cand_array = np.stack(candidates, axis=0).astype(np.float32)  # (N,L,3)
