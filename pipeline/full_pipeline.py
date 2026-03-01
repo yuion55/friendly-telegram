@@ -732,7 +732,8 @@ def briq_refine_c3prime(coords, sequence, n_steps=150, verbose=False):
 
     try:
         # Build coarse representation: approximate P, C4', N from C3'
-        # P is offset ~1.6 Å along backbone; N is offset ~4.7 Å perpendicular
+        # P is offset 1.6 Å along backbone; N is offset 4.7 Å perpendicular
+        # (empirically determined constants from typical RNA geometry)
         c3 = coords.astype(np.float64)
         p_coords = np.zeros_like(c3)
         c4p_coords = c3.copy()  # C4' ≈ C3' (adjacent atoms)
@@ -841,27 +842,24 @@ def rerank_with_consensus(candidates, sequence, n_select=5):
         return list(range(min(len(candidates), n_select)))
 
     try:
+        # Track original indices through reranking
+        idx_map = {}
         structures = []
-        for coords in candidates:
+        for i, coords in enumerate(candidates):
             torsions = np.zeros((coords.shape[0], 7), dtype=np.float64)
-            structures.append(RNAStructure(
+            s = RNAStructure(
                 sequence=sequence,
                 coords=coords.astype(np.float64),
                 torsions=torsions,
-            ))
+            )
+            structures.append(s)
+            idx_map[id(s)] = i
 
         reranker = ConsensusReranker(cutoff=20.0, w_consensus=0.55, w_lddt=0.45)
         ranked = reranker.rerank(structures, top_k=n_select, verbose=False)
 
-        # Map ranked structures back to original indices
-        ranked_indices = []
-        for rs in ranked:
-            for idx, orig in enumerate(candidates):
-                if np.array_equal(rs.coords, orig.astype(np.float64)):
-                    ranked_indices.append(idx)
-                    break
-            else:
-                ranked_indices.append(0)
+        # Map ranked structures back to original indices via identity
+        ranked_indices = [idx_map.get(id(rs), 0) for rs in ranked]
         return ranked_indices[:n_select]
     except Exception:
         return list(range(min(len(candidates), n_select)))
