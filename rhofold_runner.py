@@ -137,7 +137,7 @@ class RhoFoldRunner:
             'msa_mask': msa_mask,
         }
 
-    def predict(self, sequence, n_recycles=4):
+    def predict(self, sequence, n_recycles=4, return_plddt=False):
         """Run single-sequence inference and return C3' coordinates.
 
         Parameters
@@ -146,11 +146,15 @@ class RhoFoldRunner:
             RNA sequence string.
         n_recycles : int
             Number of recycling iterations.
+        return_plddt : bool
+            If True, also return per-residue pLDDT confidence scores.
 
         Returns
         -------
-        np.ndarray
+        np.ndarray or tuple
             Shape (L, 3) float32 predicted C3' coordinates.
+            If return_plddt=True, returns (coords, plddt) where plddt is
+            shape (L,) float32 in [0, 1].
         """
         if not self.available:
             raise RuntimeError(
@@ -163,7 +167,46 @@ class RhoFoldRunner:
             output = self.model(**inputs, num_recycles=n_recycles)
         # cord_tns_pred: (1, L, 23, 3) — C3' is atom index 4
         coords = output['cord_tns_pred'][0, :, 4, :].cpu().numpy()
-        return coords.astype(np.float32)
+        coords = coords.astype(np.float32)
+
+        if not return_plddt:
+            return coords
+
+        # Extract per-residue pLDDT confidence scores from model output
+        plddt = self._extract_plddt(output, len(sequence))
+        return coords, plddt
+
+    def _extract_plddt(self, output, L):
+        """Extract per-residue pLDDT confidence scores from RhoFold+ output.
+
+        Parameters
+        ----------
+        output : dict
+            RhoFold+ model output dict.
+        L : int
+            Sequence length.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (L,) float32 pLDDT scores in [0, 1].
+        """
+        # RhoFold+ stores pLDDT in 'plddt' key; fall back to coordinate-based
+        # proxy if key is absent (varies by RhoFold version)
+        if 'plddt' in output:
+            plddt = output['plddt'][0, :L].cpu().numpy().astype(np.float32)
+            return np.clip(plddt, 0.0, 1.0)
+
+        # Fallback: compute a proxy pLDDT from per-residue coordinate variance
+        # across atom types (lower variance → higher confidence)
+        all_atoms = output['cord_tns_pred'][0, :L, :, :]  # (L, 23, 3)
+        centroid = all_atoms.mean(dim=1, keepdim=True)  # (L, 1, 3)
+        var = torch.norm(all_atoms - centroid, dim=-1).mean(dim=-1)  # (L,)
+        # Normalise to [0, 1]: low variance → high confidence
+        var_np = var.cpu().numpy().astype(np.float32)
+        max_var = var_np.max() + 1e-8
+        plddt = 1.0 - (var_np / max_var)
+        return np.clip(plddt, 0.0, 1.0).astype(np.float32)
 
     def predict_batch(self, sequences, n_recycles=4):
         """Run batched inference on multiple sequences.
@@ -220,7 +263,8 @@ class RhoFoldRunner:
             results.append(coords)
         return results
 
-    def generate_ensemble(self, sequence, n_candidates=50, n_recycles_list=None):
+    def generate_ensemble(self, sequence, n_candidates=50, n_recycles_list=None,
+                          return_plddt=False):
         """Generate an ensemble of structure predictions via varied recycling.
 
         Uses dropout-active passes for diversity, deterministic passes for accuracy.
@@ -234,11 +278,15 @@ class RhoFoldRunner:
             Number of candidate structures to generate.
         n_recycles_list : list of int or None
             Per-candidate recycle counts. If None, cycles [1,2,3,4,4,4].
+        return_plddt : bool
+            If True, also return per-residue pLDDT scores for each candidate.
 
         Returns
         -------
-        list of np.ndarray
+        list of np.ndarray or tuple
             List of n_candidates (L, 3) float32 coordinate arrays.
+            If return_plddt=True, returns (candidates, plddts) where plddts
+            is a list of (L,) float32 arrays.
         """
         if not self.available:
             raise RuntimeError("RhoFold model not loaded.")
@@ -254,6 +302,7 @@ class RhoFoldRunner:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         candidates = []
+        plddts = []
         use_streams = self.device.type == 'cuda'
 
         if use_streams:
@@ -279,9 +328,14 @@ class RhoFoldRunner:
                 coords = output['cord_tns_pred'][0, :, 4, :].cpu().numpy()
 
             candidates.append(coords.astype(np.float32))
+            if return_plddt:
+                plddts.append(self._extract_plddt(output, len(sequence)))
 
         # Restore eval mode
         self.model.eval()
+
+        if return_plddt:
+            return candidates, plddts
         return candidates
 
 
