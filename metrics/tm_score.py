@@ -1,7 +1,17 @@
-"""TM-score and Kabsch alignment for RNA/protein structure comparison."""
+"""TM-score and Kabsch alignment for RNA/protein structure comparison.
+
+Provides CPU (@njit) and GPU (numba.cuda) implementations with auto-selection.
+"""
 
 import numpy as np
 from numba import njit, prange
+
+# Graceful CUDA import
+try:
+    from numba import cuda as _numba_cuda
+    _CUDA_AVAILABLE = _numba_cuda.is_available()
+except Exception:
+    _CUDA_AVAILABLE = False
 
 
 @njit(cache=True, parallel=True)
@@ -19,8 +29,21 @@ def _tm_score_inner(pred: np.ndarray, true: np.ndarray, d0: np.float32) -> np.fl
     return total / np.float32(L)
 
 
-def tm_score(pred: np.ndarray, true: np.ndarray) -> float:
-    """Compute TM-score between predicted and true structures.
+def _compute_d0(L):
+    """Standard TM-score length-dependent distance threshold (Zhang & Skolnick, 2004)."""
+    return np.float32(max(0.5, 1.24 * (L - 15) ** (1.0 / 3.0) - 1.8))
+
+
+def _prep_coords(arr):
+    """Normalize input to (L, 3) float32."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[:, 0, :]
+    return np.ascontiguousarray(arr)
+
+
+def tm_score_cpu(pred: np.ndarray, true: np.ndarray) -> float:
+    """Compute TM-score on CPU using @njit inner loop.
 
     Args:
         pred: Predicted coordinates, shape (L, 3) or (L, N, 3).
@@ -29,20 +52,102 @@ def tm_score(pred: np.ndarray, true: np.ndarray) -> float:
     Returns:
         TM-score as a float in [0, 1].
     """
-    pred = np.asarray(pred, dtype=np.float32)
-    true = np.asarray(true, dtype=np.float32)
-
-    # Use first atom if 3-D input
-    if pred.ndim == 3:
-        pred = pred[:, 0, :]
-    if true.ndim == 3:
-        true = true[:, 0, :]
-
+    pred = _prep_coords(pred)
+    true = _prep_coords(true)
     L = pred.shape[0]
-    # Standard TM-score length-dependent distance threshold (Zhang & Skolnick, 2004)
-    d0 = np.float32(max(0.5, 1.24 * (L - 15) ** (1.0 / 3.0) - 1.8))
-
+    d0 = _compute_d0(L)
     return float(_tm_score_inner(pred, true, d0))
+
+
+def tm_score_gpu(pred: np.ndarray, true: np.ndarray) -> float:
+    """Compute TM-score on GPU using numba.cuda kernel.
+
+    Falls back to CPU if CUDA is not available.
+
+    Args:
+        pred: Predicted coordinates, shape (L, 3) or (L, N, 3).
+        true: True coordinates, shape (L, 3) or (L, N, 3).
+
+    Returns:
+        TM-score as a float in [0, 1].
+    """
+    if not _CUDA_AVAILABLE:
+        return tm_score_cpu(pred, true)
+
+    from gpu_kernels import tm_score_gpu_kernel
+
+    pred = _prep_coords(pred)
+    true = _prep_coords(true)
+    L = pred.shape[0]
+    d0 = _compute_d0(L)
+
+    pred_flat = _numba_cuda.to_device(np.ascontiguousarray(pred.reshape(-1)))
+    true_flat = _numba_cuda.to_device(np.ascontiguousarray(true.reshape(-1)))
+    d0_arr = _numba_cuda.to_device(np.array([d0], dtype=np.float32))
+    L_arr = np.array([L], dtype=np.int32)
+    out = _numba_cuda.device_array(1, dtype=np.float32)
+
+    block_size = min(L, 1024)
+    tm_score_gpu_kernel[(1,), (block_size,)](pred_flat, true_flat, L_arr, d0_arr, out)
+    return float(out.copy_to_host()[0])
+
+
+def tm_score_batch_gpu(preds: list, true: np.ndarray) -> np.ndarray:
+    """Compute TM-scores of N predictions against one true structure on GPU.
+
+    Args:
+        preds: List of (L, 3) float32 predicted coordinate arrays.
+        true: True coordinates, shape (L, 3) or (L, N, 3).
+
+    Returns:
+        (N,) float32 array of TM-scores.
+    """
+    true = _prep_coords(true)
+    N = len(preds)
+    L = true.shape[0]
+    d0 = _compute_d0(L)
+
+    preds_stacked = np.concatenate(
+        [_prep_coords(p) for p in preds], axis=0
+    ).astype(np.float32)
+
+    if _CUDA_AVAILABLE:
+        from gpu_kernels import batch_tm_score_kernel
+
+        flat_cands = _numba_cuda.to_device(
+            np.ascontiguousarray(preds_stacked.reshape(-1))
+        )
+        flat_true = _numba_cuda.to_device(
+            np.ascontiguousarray(true.reshape(-1))
+        )
+        d0_arr = _numba_cuda.to_device(np.array([d0], dtype=np.float32))
+        L_arr = np.array([L], dtype=np.int32)
+        N_arr = np.array([N], dtype=np.int32)
+        d_scores = _numba_cuda.device_array(N, dtype=np.float32)
+
+        block_size = min(L, 512)
+        batch_tm_score_kernel[(N,), (block_size,)](
+            flat_cands, flat_true, N_arr, L_arr, d0_arr, d_scores
+        )
+        return d_scores.copy_to_host()
+    else:
+        from gpu_kernels import _batch_tm_score_cpu
+        return _batch_tm_score_cpu(preds_stacked, true, N, L, d0)
+
+
+def tm_score(pred: np.ndarray, true: np.ndarray) -> float:
+    """Compute TM-score — auto-selects GPU if CUDA is available, else CPU.
+
+    Args:
+        pred: Predicted coordinates, shape (L, 3) or (L, N, 3).
+        true: True coordinates, shape (L, 3) or (L, N, 3).
+
+    Returns:
+        TM-score as a float in [0, 1].
+    """
+    if _CUDA_AVAILABLE:
+        return tm_score_gpu(pred, true)
+    return tm_score_cpu(pred, true)
 
 
 def kabsch_align(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
