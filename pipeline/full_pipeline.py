@@ -354,7 +354,7 @@ def detect_structural_motifs(sequence, ss_pairs):
                 })
 
     # Detect kink-turns: G·A pairs in internal loops with asymmetric bulge
-    ss_pair_set = set((a, b) for a, b in ss_pairs)
+    ss_pair_set = set(ss_pairs)
     for i, j in ss_pairs:
         # Check for consecutive G·A pairs (kink-turn core)
         if i + 1 < L and j - 1 >= 0:
