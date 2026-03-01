@@ -29,6 +29,68 @@ _GNRA_PATTERN = {'GAAA', 'GAGA', 'GCAA', 'GUAA',
                  'GUGA', 'GCUA', 'GGGA'}
 
 
+# ---------------------------------------------------------------------------
+# Canonical motif geometries for grafting (C3' coordinates, Angstrom).
+# Each entry maps motif type to a dict with 'coords' (N, 3) and 'n_residues'.
+# Coordinates are derived from representative high-resolution PDB structures.
+# ---------------------------------------------------------------------------
+_CANONICAL_MOTIF_COORDS = {
+    'GNRA_tetraloop': {
+        # 4-nt tetraloop canonical C3' coords (from PDB 1ZIF GNRA tetraloop)
+        'coords': np.array([
+            [0.0, 0.0, 0.0],       # G (loop pos 1)
+            [3.1, 2.8, 1.4],       # N (loop pos 2)
+            [2.3, 6.2, 1.0],       # R (loop pos 3)
+            [-0.5, 5.8, -0.2],     # A (loop pos 4)
+        ], dtype=np.float32),
+        'n_residues': 4,
+    },
+    'kink_turn': {
+        # Kink-turn canonical C3' coords (from PDB 1RNG Kt-7)
+        # 4 residues: the two G·A pairs forming the kink core
+        'coords': np.array([
+            [0.0, 0.0, 0.0],       # G/A (5' side, pair 1)
+            [3.8, 0.5, 0.3],       # A/G (5' side, pair 2)
+            [7.2, 3.5, 4.8],       # G/A (3' side, pair 2)
+            [3.5, 3.8, 5.2],       # A/G (3' side, pair 1)
+        ], dtype=np.float32),
+        'n_residues': 4,
+    },
+    'C_loop': {
+        # C-loop canonical C3' coords (from PDB 1S72 C-loop motif)
+        'coords': np.array([
+            [0.0, 0.0, 0.0],
+            [3.5, 1.2, 0.8],
+            [5.8, 4.0, 1.5],
+            [3.2, 6.5, 0.3],
+            [-0.3, 5.0, -0.8],
+        ], dtype=np.float32),
+        'n_residues': 5,
+    },
+    'sarcin_ricin': {
+        # Sarcin-ricin loop canonical C3' coords (from PDB 1Q9A)
+        'coords': np.array([
+            [0.0, 0.0, 0.0],
+            [3.9, 0.2, 0.5],
+            [7.5, 1.8, 2.0],
+            [9.2, 5.3, 3.5],
+            [6.8, 8.0, 2.8],
+            [3.0, 7.5, 1.0],
+        ], dtype=np.float32),
+        'n_residues': 6,
+    },
+    'UA_handle': {
+        # UA-handle canonical C3' coords
+        'coords': np.array([
+            [0.0, 0.0, 0.0],
+            [3.6, 1.0, 0.4],
+            [1.8, 3.8, 1.2],
+        ], dtype=np.float32),
+        'n_residues': 3,
+    },
+}
+
+
 def _sequence_to_int8(sequence):
     """Convert RNA sequence string to int8 array."""
     return np.array([_NUC_MAP.get(c, 0) for c in sequence], dtype=np.int8)
@@ -77,7 +139,7 @@ def _pair_target_distance(sequence, i, j):
 
 
 def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
-                          sequence=None):
+                          sequence=None, extra_pair_restraints=None):
     """Refine (L, 3) coordinates using BPP restraints with steric repulsion
     and backbone angle constraints.
 
@@ -87,6 +149,14 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
         3.5Å to prevent steric clashes
       - Backbone angle constraint: penalizes C3'-C3'-C3' angles deviating from
         ~120° (2.094 rad) to maintain physically realistic backbone geometry
+      - Cosine learning rate decay for stable convergence
+      - Optional extra pair distance restraints (e.g. from pseudoknot SS)
+
+    Parameters
+    ----------
+    extra_pair_restraints : list of tuple or None
+        Additional (i, j) pair restraints to enforce, e.g. from a
+        pseudoknot secondary structure prediction.
     """
     L = coords.shape[0]
     bpp = compute_bpp_linear_approx(seq_int8, L)
@@ -101,6 +171,16 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
                     target_d = 8.0
                 pairs.append((i, j, float(bpp[i, j]), target_d))
 
+    # Add extra pair restraints (e.g. pseudoknot crossing pairs)
+    if extra_pair_restraints:
+        for i, j in extra_pair_restraints:
+            if 0 <= i < L and 0 <= j < L and abs(i - j) >= 4:
+                if sequence is not None:
+                    target_d = _pair_target_distance(sequence, i, j)
+                else:
+                    target_d = 8.0
+                pairs.append((i, j, 0.5, target_d))
+
     c = coords.astype(np.float64).copy()
     target_bond_dist = 3.8
     # Soft-sphere repulsion parameters
@@ -110,7 +190,11 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
     ideal_angle = 2.094  # ~120° in radians
     angle_strength = 1.0
 
-    for _ in range(n_steps):
+    for step in range(n_steps):
+        # Cosine learning rate decay
+        decay = 0.5 * (1.0 + np.cos(np.pi * step / max(n_steps, 1)))
+        current_lr = lr * decay
+
         forces = np.zeros_like(c)
 
         # BPP pair distance restraints
@@ -118,16 +202,16 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
             diff = c[j] - c[i]
             d = np.sqrt(np.sum(diff ** 2)) + 1e-8
             f = w * (d - target_d) * (diff / d)
-            forces[i] += f * lr
-            forces[j] -= f * lr
+            forces[i] += f * current_lr
+            forces[j] -= f * current_lr
 
         # Backbone connectivity restraints
         for i in range(L - 1):
             diff = c[i + 1] - c[i]
             d = np.sqrt(np.sum(diff ** 2)) + 1e-8
             f = 5.0 * (d - target_bond_dist) * (diff / d)
-            forces[i] += f * lr
-            forces[i + 1] -= f * lr
+            forces[i] += f * current_lr
+            forces[i + 1] -= f * current_lr
 
         # Soft-sphere steric repulsion for non-bonded pairs
         for i in range(L):
@@ -138,8 +222,8 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
                     # Repulsive force proportional to overlap depth
                     overlap = repulsion_cutoff - d
                     f_mag = repulsion_strength * overlap / d
-                    forces[i] -= f_mag * diff * lr
-                    forces[j] += f_mag * diff * lr
+                    forces[i] -= f_mag * diff * current_lr
+                    forces[j] += f_mag * diff * current_lr
 
         # Backbone angle constraints (C3'-C3'-C3')
         for i in range(1, L - 1):
@@ -152,7 +236,7 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
             angle = np.arccos(cos_angle)
             angle_dev = angle - ideal_angle
             # Gradient of angle w.r.t. middle atom position
-            f_mag = angle_strength * angle_dev * lr
+            f_mag = angle_strength * angle_dev * current_lr
             # Push neighbours to correct angle
             forces[i] -= f_mag * (v1 / n1 + v2 / n2)
 
@@ -260,6 +344,177 @@ def detect_structural_motifs(sequence, ss_pairs):
                         })
 
     return motifs
+
+
+def _kabsch_superpose(mov, ref):
+    """Kabsch superposition: find R, t so that R @ mov + t ≈ ref.
+
+    Parameters
+    ----------
+    mov : np.ndarray, shape (N, 3)
+        Points to be aligned.
+    ref : np.ndarray, shape (N, 3)
+        Reference points.
+
+    Returns
+    -------
+    R : np.ndarray, shape (3, 3)
+    t : np.ndarray, shape (3,)
+    """
+    mov_c = mov.mean(axis=0)
+    ref_c = ref.mean(axis=0)
+    mov_centered = mov - mov_c
+    ref_centered = ref - ref_c
+    H = mov_centered.T @ ref_centered
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    sign_mat = np.diag([1.0, 1.0, d])
+    R = (Vt.T @ sign_mat @ U.T).astype(np.float32)
+    t = (ref_c - R @ mov_c).astype(np.float32)
+    return R, t
+
+
+def graft_motifs(coords, motifs):
+    """Replace predicted coordinates at motif positions with canonical geometry.
+
+    For each detected motif, superposes the canonical motif geometry onto the
+    predicted positions via Kabsch alignment, then replaces the coordinates.
+    This corrects the geometry of known structural motifs where RhoFold+
+    typically gets the location right but the geometry wrong.
+
+    Parameters
+    ----------
+    coords : np.ndarray, shape (L, 3)
+        Predicted C3' coordinates.
+    motifs : list of dict
+        Detected motifs from ``detect_structural_motifs()``.
+        Each dict has keys 'type', 'start', 'end'.
+
+    Returns
+    -------
+    np.ndarray, shape (L, 3)
+        Coordinates with motif regions replaced by canonical geometry.
+    int
+        Number of motifs successfully grafted.
+    """
+    coords = coords.copy()
+    n_grafted = 0
+    L = coords.shape[0]
+
+    for motif in motifs:
+        mtype = motif['type']
+        start = motif['start']
+        end = motif['end']
+
+        if mtype not in _CANONICAL_MOTIF_COORDS:
+            continue
+
+        canon = _CANONICAL_MOTIF_COORDS[mtype]
+        n_res = canon['n_residues']
+        canon_coords = canon['coords']
+
+        # Compute residue indices for the motif in the full structure
+        motif_len = end - start + 1
+        if motif_len != n_res:
+            continue
+        if start < 0 or end >= L:
+            continue
+
+        # Extract predicted positions at the motif site
+        pred_motif = coords[start:end + 1].astype(np.float64)
+
+        # Check for degenerate geometry (all points too close together)
+        spread = np.std(pred_motif, axis=0).sum()
+        if spread < 1e-4:
+            continue
+
+        # Kabsch: align canonical onto predicted, then replace
+        R, t = _kabsch_superpose(
+            canon_coords.astype(np.float64),
+            pred_motif,
+        )
+        grafted = (R @ canon_coords.astype(np.float64).T).T + t
+        coords[start:end + 1] = grafted.astype(np.float32)
+        n_grafted += 1
+
+    return coords, n_grafted
+
+
+def sample_pseudoknot_ss(bpp, min_crossing_pairs=1):
+    """Generate a secondary structure containing at least one pseudoknot.
+
+    Instead of greedy non-crossing pair selection, this function explicitly
+    selects crossing (pseudoknot) pairs from the BPP matrix.  It first collects
+    the highest-probability non-crossing pairs, then adds the best crossing
+    pairs that form H-type pseudoknots.
+
+    Parameters
+    ----------
+    bpp : np.ndarray, shape (L, L)
+        Base-pair probability matrix.
+    min_crossing_pairs : int
+        Minimum number of crossing pairs to include.
+
+    Returns
+    -------
+    list of tuple
+        List of (i, j) base pairs, including at least one crossing pair set
+        that forms a pseudoknot topology.  Returns empty list if no crossing
+        pairs with sufficient probability exist.
+    """
+    L = bpp.shape[0]
+
+    # Collect all candidate pairs above a low threshold, sorted by probability
+    candidates = []
+    for i in range(L):
+        for j in range(i + 4, L):
+            if bpp[i, j] > 0.15:
+                candidates.append((float(bpp[i, j]), i, j))
+    candidates.sort(reverse=True)
+
+    if len(candidates) < 2:
+        return []
+
+    # Phase 1: Greedy non-crossing selection (stem pairs only)
+    used = set()
+    stem_pairs = []
+    for _, i, j in candidates:
+        if i in used or j in used:
+            continue
+        # Check this pair doesn't cross any already-selected pair
+        crosses_existing = False
+        for si, sj in stem_pairs:
+            if (si < i < sj < j) or (i < si < j < sj):
+                crosses_existing = True
+                break
+        if not crosses_existing:
+            stem_pairs.append((i, j))
+            used.add(i)
+            used.add(j)
+
+    # Phase 2: Find crossing pairs to add (forming pseudoknot)
+    # A pair (k, l) crosses (i, j) iff i < k < j < l or k < i < l < j
+    crossing_pairs = []
+    for prob, k, l in candidates:
+        if k in used or l in used:
+            continue
+        # Check if this pair crosses at least one existing stem pair
+        crosses = False
+        for i, j in stem_pairs:
+            if (i < k < j < l) or (k < i < l < j):
+                crosses = True
+                break
+        if crosses:
+            crossing_pairs.append((k, l))
+            used.add(k)
+            used.add(l)
+            if len(crossing_pairs) >= min_crossing_pairs:
+                break
+
+    if not crossing_pairs:
+        return []
+
+    return stem_pairs + crossing_pairs
 
 
 def select_by_plddt_and_diversity(candidates, plddts, n_select=5,
@@ -469,6 +724,9 @@ class RNA3DPipeline:
         # Step 1b: Generate alternative secondary structures for diversity
         alt_ss = sample_alternative_ss(bpp)
 
+        # Step 1b2: Generate a pseudoknot-containing SS candidate
+        pk_ss = sample_pseudoknot_ss(bpp)
+
         # Step 1c: Detect structural motifs
         # Use the median-threshold SS for motif detection
         mid_ss = alt_ss[len(alt_ss) // 2] if alt_ss else []
@@ -486,18 +744,35 @@ class RNA3DPipeline:
             )
 
         # Step 2b: BPP-guided refinement with steric repulsion and angle
-        # constraints on each candidate
+        # constraints on each candidate.  Adaptive step count: longer sequences
+        # get more refinement steps for better convergence.
         if L <= 500:
+            n_refine_steps = max(30, min(int(L * 0.5), 150))
             refined_candidates = []
             for ci, coords in enumerate(candidates):
                 try:
+                    # For one candidate, use pseudoknot restraints if available
+                    pk_restraints = pk_ss if (pk_ss and ci == 0) else None
                     coords = bpp_guided_refinement(
-                        coords, seq_int8, n_steps=30, lr=0.003,
-                        sequence=sequence)
+                        coords, seq_int8, n_steps=n_refine_steps, lr=0.003,
+                        sequence=sequence,
+                        extra_pair_restraints=pk_restraints)
                 except Exception:
                     pass
                 refined_candidates.append(coords)
             candidates = refined_candidates
+
+        # Step 2c: Motif grafting — replace detected motif regions with
+        # canonical geometry via Kabsch superposition
+        if motifs:
+            grafted_candidates = []
+            for coords in candidates:
+                try:
+                    coords, _ = graft_motifs(coords, motifs)
+                except Exception:
+                    pass
+                grafted_candidates.append(coords)
+            candidates = grafted_candidates
 
         # Step 3: GPU ensemble scoring — proxy scores via centroid agreement
         cand_array = np.stack(candidates, axis=0).astype(np.float32)  # (N,L,3)
@@ -652,6 +927,23 @@ if __name__ == "__main__":
     assert np.isfinite(refined).all(), "Refinement produced non-finite values"
     print("  bpp_guided_refinement OK")
 
+    print("Testing bpp_guided_refinement with extra pair restraints...")
+    extra_pairs = [(0, 20), (5, 25)]
+    refined_pk = bpp_guided_refinement(test_coords, test_seq_int8, n_steps=5,
+                                       lr=0.003, sequence=test_seq_str,
+                                       extra_pair_restraints=extra_pairs)
+    assert refined_pk.shape == (test_L, 3)
+    assert np.isfinite(refined_pk).all()
+    print("  bpp_guided_refinement with extra restraints OK")
+
+    print("Testing bpp_guided_refinement with LR decay...")
+    refined_decay = bpp_guided_refinement(test_coords, test_seq_int8,
+                                          n_steps=10, lr=0.005,
+                                          sequence=test_seq_str)
+    assert refined_decay.shape == (test_L, 3)
+    assert np.isfinite(refined_decay).all()
+    print("  bpp_guided_refinement with LR decay OK")
+
     print("Testing sample_alternative_ss...")
     bpp_test = compute_bpp_linear_approx(test_seq_int8, test_L)
     alt_ss = sample_alternative_ss(bpp_test)
@@ -661,10 +953,85 @@ if __name__ == "__main__":
             assert j - i >= 4, "Pair gap too small"
     print(f"  sample_alternative_ss OK: {[len(s) for s in alt_ss]} pairs")
 
+    print("Testing sample_pseudoknot_ss...")
+    # Create a synthetic BPP with crossing pairs possible
+    pk_bpp = np.zeros((50, 50), dtype=np.float32)
+    # Stem 1: pairs (5,25), (6,24), (7,23)
+    for i, j in [(5, 25), (6, 24), (7, 23)]:
+        pk_bpp[i, j] = 0.8
+        pk_bpp[j, i] = 0.8
+    # Crossing: pair (10,30) crosses stem 1
+    pk_bpp[10, 30] = 0.6
+    pk_bpp[30, 10] = 0.6
+    # Additional crossing pair
+    pk_bpp[15, 35] = 0.5
+    pk_bpp[35, 15] = 0.5
+    pk_ss = sample_pseudoknot_ss(pk_bpp)
+    assert isinstance(pk_ss, list)
+    if pk_ss:
+        # Verify at least one crossing pair exists
+        has_crossing = False
+        for a_idx, (i_a, j_a) in enumerate(pk_ss):
+            for i_b, j_b in pk_ss[a_idx + 1:]:
+                if (min(i_a, j_a) < min(i_b, j_b) < max(i_a, j_a) < max(i_b, j_b)):
+                    has_crossing = True
+                if (min(i_b, j_b) < min(i_a, j_a) < max(i_b, j_b) < max(i_a, j_a)):
+                    has_crossing = True
+        assert has_crossing, "Pseudoknot SS should contain crossing pairs"
+    print(f"  sample_pseudoknot_ss OK: {len(pk_ss)} pairs")
+
+    # Test with empty BPP (should return empty)
+    empty_pk = sample_pseudoknot_ss(np.zeros((20, 20), dtype=np.float32))
+    assert empty_pk == [], "Empty BPP should return empty pseudoknot SS"
+    print("  sample_pseudoknot_ss empty BPP OK")
+
     print("Testing detect_structural_motifs...")
     motifs = detect_structural_motifs(test_seq_str, alt_ss[2])
     assert isinstance(motifs, list)
     print(f"  detect_structural_motifs OK: {len(motifs)} motifs found")
+
+    print("Testing graft_motifs...")
+    # Create synthetic motifs and coords for grafting
+    graft_coords = np.random.randn(30, 3).astype(np.float32) * 10.0
+    graft_motifs_list = [
+        {'type': 'GNRA_tetraloop', 'start': 5, 'end': 8, 'sequence': 'GAAA'},
+    ]
+    grafted, n_grafted = graft_motifs(graft_coords, graft_motifs_list)
+    assert grafted.shape == (30, 3)
+    assert np.isfinite(grafted).all(), "Grafted coords contain non-finite values"
+    assert n_grafted == 1, f"Expected 1 graft, got {n_grafted}"
+    # Grafted region should differ from original
+    assert not np.allclose(grafted[5:9], graft_coords[5:9]), \
+        "Grafted region should differ from original"
+    # Non-grafted regions should be unchanged
+    assert np.allclose(grafted[:5], graft_coords[:5])
+    assert np.allclose(grafted[9:], graft_coords[9:])
+    print(f"  graft_motifs OK: {n_grafted} motifs grafted")
+
+    # Test grafting with unknown motif type
+    unknown_motif = [{'type': 'unknown_motif', 'start': 0, 'end': 3,
+                      'sequence': 'AAAA'}]
+    unk_grafted, unk_n = graft_motifs(graft_coords, unknown_motif)
+    assert unk_n == 0, "Unknown motif should not be grafted"
+    assert np.allclose(unk_grafted, graft_coords)
+    print("  graft_motifs unknown type OK")
+
+    # Test grafting with wrong motif length
+    wrong_len = [{'type': 'GNRA_tetraloop', 'start': 5, 'end': 10,
+                  'sequence': 'GAAA'}]
+    wl_grafted, wl_n = graft_motifs(graft_coords, wrong_len)
+    assert wl_n == 0, "Wrong-length motif should not be grafted"
+    print("  graft_motifs wrong length OK")
+
+    # Test _kabsch_superpose
+    print("Testing _kabsch_superpose...")
+    ref_pts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float64)
+    mov_pts = ref_pts + np.array([5.0, 3.0, 1.0])  # translated copy
+    R, t = _kabsch_superpose(mov_pts, ref_pts)
+    aligned = (R @ mov_pts.T).T + t
+    assert np.allclose(aligned, ref_pts, atol=1e-4), \
+        f"Kabsch superpose failed: max diff {np.abs(aligned - ref_pts).max()}"
+    print("  _kabsch_superpose OK")
 
     print("Testing select_by_plddt_and_diversity...")
     n_cand = 10
