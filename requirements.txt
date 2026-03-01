@@ -1,0 +1,9 @@
+torch>=2.2.0
+numpy>=1.26.0
+numba>=0.59.0
+pandas>=2.2.0
+tqdm>=4.66.0
+scikit-learn>=1.4.0
+scipy>=1.13.0
+ripser>=0.6.8
+persim>=0.3.7
