@@ -114,6 +114,10 @@ _CANONICAL_MOTIF_COORDS = {
     },
 }
 
+# Alias so that sequence-only motif detection ('GNRA_candidate') can also be
+# grafted using the same canonical tetraloop geometry.
+_CANONICAL_MOTIF_COORDS['GNRA_candidate'] = _CANONICAL_MOTIF_COORDS['GNRA_tetraloop']
+
 
 def _sequence_to_int8(sequence):
     """Convert RNA sequence string to int8 array."""
@@ -237,17 +241,15 @@ def bpp_guided_refinement(coords, seq_int8, n_steps=50, lr=0.005,
             forces[i] += f * current_lr
             forces[i + 1] -= f * current_lr
 
-        # Soft-sphere steric repulsion for non-bonded pairs
-        for i in range(L):
-            for j in range(i + 2, L):  # skip bonded neighbours
-                diff = c[j] - c[i]
-                d = np.sqrt(np.sum(diff ** 2)) + 1e-8
-                if d < repulsion_cutoff:
-                    # Repulsive force proportional to overlap depth
-                    overlap = repulsion_cutoff - d
-                    f_mag = repulsion_strength * overlap / d
-                    forces[i] -= f_mag * diff * current_lr
-                    forces[j] += f_mag * diff * current_lr
+        # Soft-sphere steric repulsion for non-bonded pairs (vectorized)
+        diffs_all = c[:, None, :] - c[None, :, :]  # (L, L, 3)
+        dists_all = np.sqrt((diffs_all ** 2).sum(axis=-1)) + 1e-8  # (L, L)
+        _idx = np.arange(L)
+        rep_mask = (np.abs(_idx[:, None] - _idx[None, :]) >= 2) & (dists_all < repulsion_cutoff)
+        if rep_mask.any():
+            overlap = np.where(rep_mask, repulsion_cutoff - dists_all, 0.0)
+            f_mag = repulsion_strength * overlap / dists_all
+            forces += np.sum(f_mag[:, :, None] * diffs_all, axis=1) * current_lr
 
         # Backbone angle constraints (C3'-C3'-C3')
         for i in range(1, L - 1):
@@ -352,12 +354,13 @@ def detect_structural_motifs(sequence, ss_pairs):
                 })
 
     # Detect kink-turns: G·A pairs in internal loops with asymmetric bulge
+    ss_pair_set = set(ss_pairs)
     for i, j in ss_pairs:
         # Check for consecutive G·A pairs (kink-turn core)
         if i + 1 < L and j - 1 >= 0:
             if (sequence[i] == 'G' and sequence[j] == 'A') or \
                (sequence[i] == 'A' and sequence[j] == 'G'):
-                if (i + 1, j - 1) in [(a, b) for a, b in ss_pairs]:
+                if (i + 1, j - 1) in ss_pair_set:
                     if (sequence[i + 1] == 'A' and sequence[j - 1] == 'G') or \
                        (sequence[i + 1] == 'G' and sequence[j - 1] == 'A'):
                         motifs.append({
@@ -542,7 +545,7 @@ def sample_pseudoknot_ss(bpp, min_crossing_pairs=1):
 
 
 def select_by_plddt_and_diversity(candidates, plddts, n_select=5,
-                                  diversity_weight=0.3):
+                                  diversity_weight=0.3, force_include=None):
     """Select conformers using both pLDDT confidence and structural diversity.
 
     Selects high-confidence structures while maintaining structural diversity
@@ -559,6 +562,8 @@ def select_by_plddt_and_diversity(candidates, plddts, n_select=5,
         Number of conformers to select.
     diversity_weight : float
         Weight for diversity score vs pLDDT (0=pure pLDDT, 1=pure diversity).
+    force_include : list of int or None
+        Indices that must appear in the selection (e.g. pseudoknot conformer).
 
     Returns
     -------
@@ -578,10 +583,19 @@ def select_by_plddt_and_diversity(candidates, plddts, n_select=5,
     else:
         plddt_norm = np.ones_like(mean_plddts)
 
-    # Greedy selection: first pick highest pLDDT, then balance diversity
-    selected = [int(np.argmax(mean_plddts))]
+    # Seed the selected set with force-included indices + highest pLDDT
+    selected = []
+    if force_include:
+        for fi in force_include:
+            if 0 <= fi < n and fi not in selected:
+                selected.append(fi)
+    best_idx = int(np.argmax(mean_plddts))
+    if not selected:
+        selected.append(best_idx)
+    elif best_idx not in selected and len(selected) < n_select:
+        selected.append(best_idx)
 
-    for _ in range(n_select - 1):
+    for _ in range(n_select - len(selected)):
         best_j, best_score = -1, -1.0
         for j in range(n):
             if j in selected:
@@ -821,7 +835,7 @@ def predict_interdomain_contact_restraints(sequence, domain_ranges):
         return []
 
 
-def rerank_with_consensus(candidates, sequence, n_select=5):
+def rerank_with_consensus(candidates, sequence, n_select=5, force_include=None):
     """Rerank conformer candidates using consensus contact map + lDDT proxy.
 
     Parameters
@@ -832,6 +846,8 @@ def rerank_with_consensus(candidates, sequence, n_select=5):
         RNA sequence.
     n_select : int
         Number of conformers to return.
+    force_include : list of int or None
+        Indices that must appear in the selection (e.g. pseudoknot conformer).
 
     Returns
     -------
@@ -860,6 +876,12 @@ def rerank_with_consensus(candidates, sequence, n_select=5):
 
         # Map ranked structures back to original indices via identity
         ranked_indices = [idx_map.get(id(rs), 0) for rs in ranked]
+
+        # Ensure force-included indices are present
+        if force_include:
+            for fi in force_include:
+                if 0 <= fi < len(candidates) and fi not in ranked_indices:
+                    ranked_indices.insert(0, fi)
         return ranked_indices[:n_select]
     except Exception:
         return list(range(min(len(candidates), n_select)))
@@ -1013,6 +1035,7 @@ class RNA3DPipeline:
         verified = []
         verified_certs = []
         verified_proxy = []
+        verified_orig_indices = []  # Track which original candidates passed filter
 
         # Precompute pair list from bpp (done once, reused per candidate)
         pair_list = []
@@ -1036,6 +1059,7 @@ class RNA3DPipeline:
             verified.append(coords)
             verified_certs.append(cert)
             verified_proxy.append(proxy_scores[ci])
+            verified_orig_indices.append(ci)
 
         if len(verified) == 0:
             # Fallback: use first candidates
@@ -1049,17 +1073,17 @@ class RNA3DPipeline:
                 verified_proxy.append(
                     proxy_scores[ci] if ci < len(proxy_scores) else 0.0
                 )
+                verified_orig_indices.append(ci)
 
         # Step 6: Reranking — use pLDDT + diversity when available, else TM matrix
         N_v = len(verified)
         n_sel = min(n_submit, N_v)
 
         if plddts is not None and N_v > 1:
-            # Collect pLDDT arrays for verified candidates
+            # Collect pLDDT arrays for verified candidates using tracked indices
             verified_plddts = []
-            for ci_orig in range(len(candidates)):
-                # Match verified candidates back to original indices
-                if candidates[ci_orig] is not None and ci_orig < len(plddts):
+            for ci_orig in verified_orig_indices:
+                if ci_orig < len(plddts):
                     verified_plddts.append(plddts[ci_orig])
             # If we have enough pLDDT data, use confidence-based selection
             if len(verified_plddts) >= N_v:
