@@ -354,12 +354,13 @@ def detect_structural_motifs(sequence, ss_pairs):
                 })
 
     # Detect kink-turns: G·A pairs in internal loops with asymmetric bulge
+    ss_pair_set = set((a, b) for a, b in ss_pairs)
     for i, j in ss_pairs:
         # Check for consecutive G·A pairs (kink-turn core)
         if i + 1 < L and j - 1 >= 0:
             if (sequence[i] == 'G' and sequence[j] == 'A') or \
                (sequence[i] == 'A' and sequence[j] == 'G'):
-                if (i + 1, j - 1) in [(a, b) for a, b in ss_pairs]:
+                if (i + 1, j - 1) in ss_pair_set:
                     if (sequence[i + 1] == 'A' and sequence[j - 1] == 'G') or \
                        (sequence[i + 1] == 'G' and sequence[j - 1] == 'A'):
                         motifs.append({
@@ -1034,6 +1035,7 @@ class RNA3DPipeline:
         verified = []
         verified_certs = []
         verified_proxy = []
+        verified_orig_indices = []  # Track which original candidates passed filter
 
         # Precompute pair list from bpp (done once, reused per candidate)
         pair_list = []
@@ -1057,6 +1059,7 @@ class RNA3DPipeline:
             verified.append(coords)
             verified_certs.append(cert)
             verified_proxy.append(proxy_scores[ci])
+            verified_orig_indices.append(ci)
 
         if len(verified) == 0:
             # Fallback: use first candidates
@@ -1070,17 +1073,17 @@ class RNA3DPipeline:
                 verified_proxy.append(
                     proxy_scores[ci] if ci < len(proxy_scores) else 0.0
                 )
+                verified_orig_indices.append(ci)
 
         # Step 6: Reranking — use pLDDT + diversity when available, else TM matrix
         N_v = len(verified)
         n_sel = min(n_submit, N_v)
 
         if plddts is not None and N_v > 1:
-            # Collect pLDDT arrays for verified candidates
+            # Collect pLDDT arrays for verified candidates using tracked indices
             verified_plddts = []
-            for ci_orig in range(len(candidates)):
-                # Match verified candidates back to original indices
-                if candidates[ci_orig] is not None and ci_orig < len(plddts):
+            for ci_orig in verified_orig_indices:
+                if ci_orig < len(plddts):
                     verified_plddts.append(plddts[ci_orig])
             # If we have enough pLDDT data, use confidence-based selection
             if len(verified_plddts) >= N_v:
