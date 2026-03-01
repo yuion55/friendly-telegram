@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+data/
+/kaggle/
+validation_results_*.csv
+*.nbi
+*.nbc
