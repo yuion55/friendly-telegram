@@ -11,3 +11,4 @@ data/
 validation_results_*.csv
 *.nbi
 *.nbc
+profiler_trace.json
