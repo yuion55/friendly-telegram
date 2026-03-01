@@ -63,7 +63,10 @@ class RNA3DPipeline:
         self.device = device or _DEVICE
         self.topology_corrector = TopologyCorrector()
         self.certificate = ChordDiagramCertificate()
-        self.rhofold = RhoFoldRunner(self.device)
+        self.rhofold = RhoFoldRunner(
+            self.device,
+            weights_path=self.config.get('weights_path'),
+        )
 
     def _generate_candidates_fallback(self, sequence, n_candidates):
         """Fallback candidate generation via torsion-space diffusion."""

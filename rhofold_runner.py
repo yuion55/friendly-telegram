@@ -27,12 +27,43 @@ _HF_MODEL_ID = "ml4bio/RhoFold"
 _HF_FILENAME = "rhofold_pretrained.pt"
 
 
-def _download_weights(cache_dir=_CACHE_DIR):
-    """Download pretrained RhoFold weights from HuggingFace hub."""
+def _download_weights(cache_dir=_CACHE_DIR, weights_path=None):
+    """Download or locate pretrained RhoFold weights.
+
+    Parameters
+    ----------
+    cache_dir : str
+        Directory for caching downloaded weights.
+    weights_path : str or None
+        Explicit path to a local weights file.  When provided, the file is
+        used directly and no download is attempted (offline-friendly).
+
+    Returns
+    -------
+    str
+        Path to the weights file.
+    """
+    # 1. Explicit local path (Kaggle offline dataset, etc.)
+    if weights_path is not None:
+        if os.path.isfile(weights_path):
+            return weights_path
+        raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+    # 2. Cached copy
     os.makedirs(cache_dir, exist_ok=True)
     local_path = os.path.join(cache_dir, _HF_FILENAME)
     if os.path.isfile(local_path):
         return local_path
+
+    # 3. Well-known Kaggle dataset paths (pre-downloaded during internet-on)
+    for kaggle_path in [
+        "/kaggle/input/rhofold-weights/rhofold_pretrained.pt",
+        "/kaggle/input/rhofold-weights/models--ml4bio--RhoFold/rhofold_pretrained.pt",
+    ]:
+        if os.path.isfile(kaggle_path):
+            return kaggle_path
+
+    # 4. Download from HuggingFace Hub
     if not _HF_HUB_AVAILABLE:
         raise ImportError(
             "huggingface_hub is required to download RhoFold weights. "
@@ -53,9 +84,12 @@ class RhoFoldRunner:
     ----------
     device : str or torch.device
         Target device ('cuda' or 'cpu'). Falls back to CPU if CUDA unavailable.
+    weights_path : str or None
+        Explicit path to pretrained weights file.  When provided, no download
+        is attempted — useful for Kaggle offline submissions.
     """
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, weights_path=None):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -64,7 +98,7 @@ class RhoFoldRunner:
             self.model = None
             return
 
-        ckpt_path = _download_weights()
+        ckpt_path = _download_weights(weights_path=weights_path)
         self.model = _RhoFoldModel.from_pretrained(ckpt_path)
         self.model.eval()
         self.model = torch.compile(
@@ -269,6 +303,13 @@ if __name__ == "__main__":
     # Verify encoding
     expected = [0, 3, 2, 1, 0, 3, 2, 1]  # A=0, U=3, G=2, C=1
     assert inputs['seq'][0].tolist() == expected
+
+    # Test offline weights_path rejection for nonexistent file
+    try:
+        _download_weights(weights_path="/nonexistent/weights.pt")
+        assert False, "Should have raised FileNotFoundError"
+    except FileNotFoundError:
+        pass
 
     if runner.available:
         coords = runner.predict(seq)
